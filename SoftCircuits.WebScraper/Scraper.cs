@@ -6,9 +6,11 @@ using SoftCircuits.CsvParser;
 using SoftCircuits.HtmlMonkey;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Threading.Tasks;
 
 [assembly: InternalsVisibleTo("WebScraper.Tests")]
@@ -44,6 +46,7 @@ namespace SoftCircuits.WebScraper
         /// </summary>
         public string ItemSelector { get; set; }
 
+
         /// <summary>
         /// Gets or sets the selector that identifies the element(s) that, if present,
         /// indicate there is another page. Only used when the <c>{page}</c> placeholder
@@ -75,6 +78,11 @@ namespace SoftCircuits.WebScraper
         public string DataSeparator { get; set; } = ",";
 
         /// <summary>
+        /// Character to use when ending a csv-line
+        /// </summary>
+        public string NewLineCharacter { get; set; } = Environment.NewLine;
+
+        /// <summary>
         /// Gets the number of URLs successfully scanned on the last pass.
         /// </summary>
         public int UrlsScanned { get; private set; }
@@ -83,6 +91,17 @@ namespace SoftCircuits.WebScraper
         /// Get the number of URL errors on the last pass.
         /// </summary>
         public int UrlErrors { get; private set; }
+
+        /// <summary>
+        /// Use http post instead of get
+        /// </summary>
+        public bool UseHttpPost { get; set; } = false;
+
+        /// <summary>
+        /// Optional form content to use together with a http post.
+        /// Only used if UseHttpPost is true.
+        /// </summary>
+        public Dictionary<string, string> HttpPostFormContent { get; set; }
 
         /// <summary>
         /// Event raised to provide current progress. Can also be used to
@@ -104,14 +123,33 @@ namespace SoftCircuits.WebScraper
             Placeholders = new List<Placeholder>();
             Fields = new List<Field>();
             WriteColumnHeaders = true;
+            HttpPostFormContent = new Dictionary<string, string>();
         }
+
+     
 
         /// <summary>
         /// Uses the current setting to extract data from the Internet and write
         /// the data to a CSV file with the the given name.
         /// </summary>
-        /// <param name="csvFile"></param>
+        /// <param name="csvFile"></param>3
         public async Task RunAsync(string csvFile)
+        {
+            // Verify an output file was specified
+            if (csvFile == null)
+                throw new ArgumentNullException(nameof(csvFile));
+
+            var content = await RunAsync();
+            File.WriteAllText(csvFile, content);
+        }
+
+        /// <summary>
+        /// Uses the current setting to extract data from the Internet.
+        /// The result will be returned as a string containing csv data.
+        /// </summary>
+        /// <returns></returns>
+        /// <exception cref="Exception"></exception>
+        public async Task<string> RunAsync()
         {
             int current = 0;
             int total;
@@ -120,10 +158,6 @@ namespace SoftCircuits.WebScraper
 
             UrlsScanned = 0;
             UrlErrors = 0;
-
-            // Verify an output file was specified
-            if (csvFile == null)
-                throw new ArgumentNullException(nameof(csvFile));
 
             // Check for obvious errors
             if (string.IsNullOrWhiteSpace(Url))
@@ -154,82 +188,88 @@ namespace SoftCircuits.WebScraper
             // Initialize UpdateProgress event arguments
             UpdateProgressEventArgs eventArgs = new UpdateProgressEventArgs();
 
-            using (CsvWriter writer = new CsvWriter(csvFile))
-            {
-                // Write column headers
-                if (WriteColumnHeaders)
-                    writer.WriteRow(Fields.Select(f => f.Name));
+            var builder = new StringBuilder();
 
-                // Scan URLs
-                placeholderIterator.Reset(out string? url);
+            // Write column headers
+            if (WriteColumnHeaders)
+            {
+                builder.Append(string.Join(dataSeparator, Fields.Select(f => f.Name)));
+                builder.Append(NewLineCharacter);
+            }
+
+            // Scan URLs
+            placeholderIterator.Reset(out string? url);
+            do
+            {
+                pageIterator.Reset(url);
                 do
                 {
-                    pageIterator.Reset(url);
-                    do
+                    try
                     {
-                        try
+                        // Get next URL
+                        url = pageIterator.GetCurrentPageUrl();
+                        eventArgs.Status = $"Scanning '{url}'";
+                        eventArgs.Percent = UpdateProgressEventArgs.CalculatePercent(current, total);
+                        OnUpdateProgress(eventArgs);
+                        // Handle cancel request
+                        if (eventArgs.Cancel)
                         {
-                            // Get next URL
-                            url = pageIterator.GetCurrentPageUrl();
-                            eventArgs.Status = $"Scanning '{url}'";
-                            eventArgs.Percent = UpdateProgressEventArgs.CalculatePercent(current, total);
+                            eventArgs.Status = "Scan cancelled";
                             OnUpdateProgress(eventArgs);
-                            // Handle cancel request
-                            if (eventArgs.Cancel)
-                            {
-                                eventArgs.Status = "Scan cancelled";
-                                OnUpdateProgress(eventArgs);
-                                return;
-                            }
+                            return "";
+                        }
 
-                            // Download and parse next web page
-                            string html = await DownloadUrlAsync(url);
-                            HtmlDocument document = HtmlDocument.FromHtml(html);
+                        // Download and parse next web page
+                        string html = await DownloadUrlAsync(url);
+                        HtmlDocument document = HtmlDocument.FromHtml(html);
 
-                            // Search for containers
-                            IEnumerable<HtmlElementNode> containers = (containerSelectors.Any()) ?
+                        // Search for containers
+                        IEnumerable<HtmlElementNode> containers = (containerSelectors.Any()) ?
                                 containerSelectors.Find(document.RootNodes) :
                                 document.RootNodes.OfType<HtmlElementNode>();
-                            IEnumerable<HtmlElementNode> nodes = itemSelectors.Find(containers);
-                            hasMorePages = pageIterator.CheckIfMorePages(document);
+                        IEnumerable<HtmlElementNode> nodes = itemSelectors.Find(containers);
+                        hasMorePages = pageIterator.CheckIfMorePages(document);
 
-                            // Search for fields in each item container
-                            foreach (HtmlElementNode node in nodes)
-                            {
-                                foreach (Field field in Fields)
-                                {
-                                    IEnumerable<HtmlElementNode> matchingNodes = field.FindValue(node);
-                                    field.Value = string.Join(dataSeparator, matchingNodes.Select(n => field.GetValueFromNode(n)));
-                                }
-                                writer.WriteRow(Fields.Select(f => f.Value));
-                            }
-
-                            UrlsScanned++;
-                        }
-                        catch (Exception ex)
+                        // Search for fields in each item container
+                        foreach (HtmlElementNode node in nodes)
                         {
-                            UrlErrors++;
-                            hasMorePages = false;
-                            eventArgs.Status = $"ERROR : '{url}' : {ex.Message}";
-                            OnUpdateProgress(eventArgs);
-                            // Handle cancel request
-                            if (eventArgs.Cancel)
+                            foreach (Field field in Fields)
                             {
-                                eventArgs.Status = "Scan cancelled";
-                                OnUpdateProgress(eventArgs);
-                                return;
+                                IEnumerable<HtmlElementNode> matchingNodes = field.FindValue(node);
+                                builder.Append(string.Join(dataSeparator, matchingNodes.Select(n => field.GetValueFromNode(n))));
                             }
+                            builder.Append(NewLineCharacter);
+                        }
+
+                        UrlsScanned++;
+                    }
+                    catch (Exception ex)
+                    {
+                        UrlErrors++;
+                        hasMorePages = false;
+                        eventArgs.Status = $"ERROR : '{url}' : {ex.Message}";
+                        OnUpdateProgress(eventArgs);
+                        // Handle cancel request
+                        if (eventArgs.Cancel)
+                        {
+                            eventArgs.Status = "Scan cancelled";
+                            OnUpdateProgress(eventArgs);
+                            return "";
                         }
                     }
-                    while (hasMorePages);
-                    current++;
-                } while (placeholderIterator.Next(out url));
+                }
+                while (hasMorePages);
+                current++;
+            } while (placeholderIterator.Next(out url));
 
-                eventArgs.Status = "Scan complete";
-                eventArgs.Percent = 100;
-                OnUpdateProgress(eventArgs);
-            }
+            eventArgs.Status = "Scan complete";
+            eventArgs.Percent = 100;
+            OnUpdateProgress(eventArgs);
+
+            return builder.ToString();
+
         }
+       
 
         /// <summary>
         /// Downloads the specified URL. Does not block the current thread.
@@ -240,6 +280,23 @@ namespace SoftCircuits.WebScraper
         {
             using (HttpClient client = new HttpClient())
             {
+                if (UseHttpPost)
+                {
+                    var content = new Dictionary<string, string>();
+
+                    foreach (var formContent in HttpPostFormContent)
+                    {
+                        content.Add(formContent.Key, formContent.Value);
+                    }
+
+                    var req = new HttpRequestMessage(HttpMethod.Post, url) { Content = new FormUrlEncodedContent(content) };
+                    var response = await client.SendAsync(req);
+
+                    var contents = await response.Content.ReadAsStringAsync();
+
+                    return contents;
+                }
+
                 return await client.GetStringAsync(url);
             }
         }
